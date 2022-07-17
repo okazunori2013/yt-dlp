@@ -1,5 +1,6 @@
 import base64
 import binascii
+import codecs
 import hashlib
 import hmac
 import io
@@ -23,7 +24,6 @@ from ..utils import (
     request_to_url,
     time_seconds,
     traverse_obj,
-    update_url_query,
     urljoin,
 )
 
@@ -143,6 +143,52 @@ class AbemaLicenseHandler(urllib.request.BaseHandler):
             'Content-Length': len(response_data),
         }, url=url, code=200)
 
+    def augment_key_handler(self, handler):
+        # For /key/:ticket
+        ticket = handler.route_params['ticket']
+        response_data = self._get_videokey_from_ticket(ticket)
+        handler.send_header('Content-Length', str(len(response_data)))
+        handler.end_headers()
+        handler.wfile.write(response_data)
+        return True
+
+    def augment_hls_handler(self, handler):
+        # for /hls/:hex_url
+        hex_url = handler.route_params['hex_url']
+        url = codecs.decode(hex_url, 'hex').decode('utf8')
+        headers = dict(handler.headers)
+        # drop some "bad" headers which ffmpeg likes to add or needed to be
+        if headers.get('Range') == 'bytes=0-':
+            headers.pop('Range', None)
+        headers.pop('Host', None)
+        content, uoh = self.ie._download_webpage_handle(
+            url, False, note='Proxying HLS manifest request',
+            fatal=True, data=None if handler.command == 'GET' else handler.rfile.read(),
+            headers=headers)
+
+        def convert_lines(line):
+            if 'abematv-license://' in line:
+                # rewrite abematv-license
+                return line.replace('abematv-license://', '/key/')
+            if line.startswith('#'):
+                # metadata
+                return line
+            # segment url (which is usually relative)
+            return urljoin(url, line)
+
+        content = '\n'.join(map(convert_lines, content.splitlines())).encode('utf-8')
+        resp_headers = dict(uoh.info())
+        # drop/update some headers
+        resp_headers.pop('Content-Encoding', None)
+        resp_headers.pop('Keep-Alive', None)
+        resp_headers['Connection'] = 'close'
+        resp_headers['Content-Length'] = str(len(content))
+        for k, v in resp_headers.items():
+            handler.send_header(k, v)
+        handler.end_headers()
+        handler.wfile.write(content)
+        return True
+
 
 class AbemaTVBaseIE(InfoExtractor):
     def _extract_breadcrumb_list(self, webpage, video_id):
@@ -205,12 +251,13 @@ class AbemaTVIE(AbemaTVBaseIE):
             'description': 'md5:55f2e61f46a17e9230802d7bcc913d5f',
             'is_live': True,
         },
-        'skip': 'Not supported until yt-dlp implements native live downloader OR AbemaTV can start a local HTTP server',
+        'skip': 'things varies over time',
     }]
     _USERTOKEN = None
     _DEVICE_ID = None
     _TIMETABLE = None
     _MEDIATOKEN = None
+    _LICENSE_HANDLER = None
 
     _SECRETKEY = b'v+Gjs=25Aw5erR!J8ZuvRrCx*rGswhB&qdHd_SYerEWdU&a?3DzN9BRbp5KwY4hEmcj5#fykMjJ=AuWz5GSMY-d@H7DMEh3M@9n2G552Us$$k9cD=3TxwWe86!x#Zyhe'
 
@@ -265,8 +312,10 @@ class AbemaTVIE(AbemaTVBaseIE):
         self._USERTOKEN = user_data['token']
 
         # don't allow adding it 2 times or more, though it's guarded
+        if not self._LICENSE_HANDLER:
+            self._LICENSE_HANDLER = AbemaLicenseHandler(self)
         remove_opener(self._downloader, AbemaLicenseHandler)
-        add_opener(self._downloader, AbemaLicenseHandler(self))
+        add_opener(self._downloader, self._LICENSE_HANDLER)
 
         return self._USERTOKEN
 
@@ -345,12 +394,12 @@ class AbemaTVIE(AbemaTVBaseIE):
                     'https://api.abema.io/v1/timetable/dataSet?debug=false', video_id,
                     headers=headers)
             now = time_seconds(hours=9)
-            for slot in self._TIMETABLE.get('slots', []):
-                if slot.get('channelId') != video_id:
-                    continue
-                if slot['startAt'] <= now and now < slot['endAt']:
-                    title = slot['title']
-                    break
+            title = traverse_obj(
+                self._TIMETABLE,
+                ('slots',
+                 # find the time slice from the requested channel in timetable
+                 lambda _, v: v['channelId'] == video_id and v['startAt'] <= now and now < v['endAt'],
+                 'title'), get_all=False)
 
         # read breadcrumb on top of page
         breadcrumb = self._extract_breadcrumb_list(webpage, video_id)
@@ -391,15 +440,10 @@ class AbemaTVIE(AbemaTVBaseIE):
         is_live, m3u8_url = False, None
         if video_type == 'now-on-air':
             is_live = True
-            channel_url = 'https://api.abema.io/v1/channels'
-            if video_id == 'news-global':
-                channel_url = update_url_query(channel_url, {'division': '1'})
-            onair_channels = self._download_json(channel_url, video_id)
-            for ch in onair_channels['channels']:
-                if video_id == ch['id']:
-                    m3u8_url = ch['playback']['hls']
-                    break
-            else:
+            onair_channels = self._download_json(
+                'https://api.abema.io/v1/channels', video_id)
+            m3u8_url = traverse_obj(onair_channels, ('channels', lambda _, v: v['id'] == video_id, 'playback', 'hls'), get_all=False)
+            if not m3u8_url:
                 raise ExtractorError(f'Cannot find on-air {video_id} channel.', expected=True)
         elif video_type == 'episode':
             api_response = self._download_json(
@@ -408,7 +452,6 @@ class AbemaTVIE(AbemaTVBaseIE):
                 headers=headers)
             ondemand_types = traverse_obj(api_response, ('terms', ..., 'onDemandType'), default=[])
             if 3 not in ondemand_types:
-                # cannot acquire decryption key for these streams
                 self.report_warning('This is a premium-only stream')
 
             m3u8_url = f'https://vod-abematv.akamaized.net/program/{video_id}/playlist.m3u8'
@@ -425,10 +468,16 @@ class AbemaTVIE(AbemaTVBaseIE):
             raise ExtractorError('Unreachable')
 
         if is_live:
-            self.report_warning("This is a livestream; yt-dlp doesn't support downloading natively, but FFmpeg cannot handle m3u8 manifests from AbemaTV")
-            self.report_warning('Please consider using Streamlink to download these streams (https://github.com/streamlink/streamlink)')
+            self.report_warning('This is a livestream; downloading livestreams from AbemaTV is an experimental feature.')
+            self.report_warning('Open bug report at https://github.com/ytdl-patched/ytdl-patched/issues?q= for unplayable file')
         formats = self._extract_m3u8_formats(
             m3u8_url, video_id, ext='mp4', live=is_live)
+
+        def aug_predicate(info_dict, dl):
+            from ..downloader.external import ExternalFD
+            return info_dict.get('is_live') or isinstance(dl, ExternalFD)
+
+        from ..postprocessor.metadataparser import MetadataParserPP
 
         info.update({
             'id': video_id,
@@ -436,6 +485,27 @@ class AbemaTVIE(AbemaTVBaseIE):
             'description': description,
             'formats': formats,
             'is_live': is_live,
+            'augments': [{
+                'key': 'http_server',
+                'condition': aug_predicate,
+                'routes': [{
+                    'route': r're:/hls/(?P<hex_url>[0-9a-fA-F]+)',
+                    'callback': self._LICENSE_HANDLER.augment_hls_handler,
+                }, {
+                    'route': r're:/key/(?P<ticket>[^/&?]+)',
+                    'callback': self._LICENSE_HANDLER.augment_key_handler,
+                }]
+            }, {
+                'key': 'metadata_editor',
+                'condition': aug_predicate,
+                'actions': [
+                    # neat hack here: `replace` here can be a function
+                    # https://docs.python.org/3/library/re.html#re.sub
+                    # the first arg is an extension of MetadataParserPP, to get info_dict
+                    (MetadataParserPP.Actions.REPLACE, 'url', r'^.+$',
+                        lambda info, m: f'http://localhost:{info["_httpserverport"]}/hls/{codecs.encode(m.group(0).encode("utf-8"), "hex").decode()}'),
+                ],
+            }],
         })
         return info
 
