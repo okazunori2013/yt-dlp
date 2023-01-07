@@ -108,6 +108,7 @@ class TVerIE(TVerBaseIE):
         }
 
 
+
 class TVerSeriesIE(TVerBaseIE):
     _VALID_URL = r'https?://(?:www\.)?tver\.jp/series/(?P<id>[a-zA-Z0-9]+)'
     _TESTS = [{
